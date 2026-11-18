@@ -6,7 +6,7 @@ from ..models.audit import Audit
 class AuditMiddleware(BaseHTTPMiddleware):
     async def dispatch(self,request,call_next):
         response=await call_next(request)
-        if request.method in ('POST','PUT','DELETE'):
+        if request.method in ('POST','PUT','PATCH','DELETE'):
             actor='anonymous'
             try:actor=jwt.decode(request.headers.get('Authorization','').split(' ')[1],JWT_SECRET,algorithms=['HS256'])['sub']
             except Exception:pass

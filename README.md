@@ -12,13 +12,15 @@
 2. SQL 复核：选择基准，编辑候选，校验后创建独立批次并入 Redis 队列。
 3. 运行历史：跟踪 queued/running/passed/different/failed，失败也保留证据。
 4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载。
-5. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
+5. 账单冷热库：经 `invoices` 并集视图读冷热全量，分页限额 200；admin/operator 可新增与改账，金额/状态走版本乐观锁。
+6. 归档管理（仅 admin）：按账单号上界把已结算账单分批从热库搬到冷库，页面展示进度、游标、失败原因与逐账留痕，失败可断点重试。
+7. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
 
 | 角色 | 主要页面 | 权限与典型动作 |
 |---|---|---|
-| admin 管理员 | 全部页面、审计 | 创建样本/批次、查看/导出结果、查看写操作审计 |
-| operator 操作员 | 四个业务页面 | 登记 SQL、提交后台复核、查看/导出结果；不可查看管理员审计 |
-| viewer 观察员 | 四个业务页面 | 只读与导出；API 层拒绝所有业务写请求 |
+| admin 管理员 | 全部页面、归档、审计 | 创建样本/批次、查看/导出结果、发起/重试归档、新增与改账、查看写操作审计 |
+| operator 操作员 | 业务页面 | 登记 SQL、提交复核、查看/导出、新增与改账；不可归档、不可看审计 |
+| viewer 观察员 | 业务页面 | 只读与导出；API 层拒绝所有业务写请求（含归档与改账） |
 
 ## 快速启动
 
@@ -67,6 +69,21 @@ ORDER BY customer
 
 失败态包括语法/白名单失败（提交前 422）、缺少样本（404）、重名（409）、任务配额（429）、数据库超时/运行错误（批次 failed，保存 error）。正常差异是 different，不当成异常。
 
+## 冷热分层与归档一致性
+
+`invoices` 不再是物理表，而是 `invoices_hot UNION ALL invoices_cold` 的视图，两表同构并各带 `version` 乐观锁列，视图额外暴露 `location`。因此所有既有 SQL（含样本与复核候选）一字不改即可读到冷热全量，重复次数与金额口径不变；`query_reader` 对视图和两表都只有 SELECT 权限。
+
+归档由 admin 按**账单号上界**发起，任务状态为 pending → moving → completed/failed：
+
+- worker 按 `invoice_id` 游标分批（批大小 `ARCHIVE_BATCH_SIZE`，默认 50），每批是一个短事务：`FOR UPDATE` 锁定候选行 → 仅当 `status='settled'` 时插入冷库并删除热库 → 写逐账留痕（archived/skipped）→ 提交游标。插入冷库、删热库、留痕、游标推进同事务提交，数据位置与查询可见性**原子切换**，任何时刻同一账单只在一个库。
+- 搬运瞬间重新判定状态：迁走前恢复为待结算的账单记 skipped 并留在热库。
+- 崩溃安全：批次要么全提交要么全回滚，游标停在最后已提交账单；worker 重启后 `recover_stuck_jobs` 把 pending/moving 任务重新入队，从游标续跑，已在冷库的行不会被二次搬运，不漏账。每任务用 `pg_try_advisory_lock` 防止并发重复执行。
+- 两个归档范围重叠时，第二个任务在热库中找不到已搬走的行（冷库插入 `ON CONFLICT DO NOTHING` 兜底），逐账留痕中同一账单不会出现两次 archived。
+- 改账走 `UPDATE ... WHERE version=:期望版本`：版本不符返回 409，调用方刷新后基于新版本重试，并发改金额不丢更新；归档行锁与改账短事务互斥，搬中改账要么随新版本入冷库、要么留在热库，更新不会丢。
+- 任务的计数、游标、错误原因和逐账留痕全程可查；失败保留现场并支持从断点重试。归档与改账的写请求都进入操作审计。
+
+实测见 `backend/tests/test_archive.py`（9 项，含搬运中改账、worker 进程重启续跑、两次归档范围重叠、失败重试幂等、旧 v1 表迁移与角色限额）。
+
 ## 技术栈、结构与本地开发
 
 | 部分 | 实现 |
@@ -77,21 +94,22 @@ ORDER BY customer
 | db / cache | PostgreSQL 16、Redis 7 |
 | auth | JWT 8 小时有效，PBKDF2 SHA-256 加盐密码 |
 
-`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v1。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，各自有模型、schema、服务、路由、API、store 和页面。
+`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v2（热/冷表 + 并集视图）与 v1 升级。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，归档链为 archive job / archive item，账单链为 hot-cold invoice。
 
 后端本地：创建虚拟环境并安装 `backend/requirements.txt`，先用 Compose 启动 db/redis，设置本地可达的 DATABASE_URL/REDIS_URL/JWT_SECRET，进入 backend 执行 `uvicorn src.main:app --reload`；worker 需 `/artifacts` 可写目录并执行 `python -m src.worker`。最省事的开发方式是修改源码后 `docker compose up -d --build`。前端通过 Nginx 的 `/api/` 去前缀代理访问后端，禁止双重 `/api/api`。
 
-环境变量：COMPOSE_PROJECT_NAME（容器命名）、FRONTEND_PORT/BACKEND_PORT/DB_PORT（宿主端口）、POSTGRES_PASSWORD（演示库密码）、JWT_SECRET（签名密钥）、SEED_DEMO（默认 true）。后端容器另接收 DATABASE_URL 和 REDIS_URL。5 个服务均有 healthcheck；数据库、Redis、共享证据各自使用命名卷。
+环境变量：COMPOSE_PROJECT_NAME（容器命名）、FRONTEND_PORT/BACKEND_PORT/DB_PORT（宿主端口）、POSTGRES_PASSWORD（演示库密码）、JWT_SECRET（签名密钥）、SEED_DEMO（默认 true）、ARCHIVE_BATCH_SIZE（归档每批账单数，默认 50）。后端容器另接收 DATABASE_URL 和 REDIS_URL。5 个服务均有 healthcheck；数据库、Redis、共享证据各自使用命名卷。
 
 共享枚举位置：角色与任务状态在 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`；模型/鉴权服务/worker 消费后端值，状态标签与前端权限消费前端值。源数据 invoice status 为账单业务值 settled/pending，与任务状态独立。
 
 ## 已知边界
 
 - 小型工作流没有样本删除和版本编辑；新口径新建样本/批次，旧记录保持独立。
-- 使用固定业务数据和单实例 worker；不对接生产数据库，不部署生产高可用。
+- 使用固定业务数据和单实例 worker；不对接生产数据库，不部署生产高可用。归档靠行锁、短事务和 advisory lock 保证单实例下正确性，多实例 worker 需配合分布式锁。
 - 只允许受限 SQL 子集；不支持 CTE、窗口、跨表联接和用户自定义函数。
 - 查询会执行两次（一次 EXPLAIN ANALYZE，一次取结果）；数据源固定只读，避免两次间口径变化。
 - 后端迁移/seed 角色为本地数据库管理员；执行用户 SQL 时强制切换受限只读角色。生产应拆分独立迁移凭据。
+- 冷库账单不支持改账回写到热库；改账作用于账单当前所在库，归档后如需更正应走专门的回迁流程（当前版本未提供）。
 - Web 字体来自 Google Fonts，离线会使用 serif/monospace 回退；不影响功能。
 
 License: MIT，见 LICENSE。

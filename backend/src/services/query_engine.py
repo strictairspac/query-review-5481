@@ -6,7 +6,7 @@ from sqlglot import exp
 from sqlalchemy import text
 from ..config.database import engine
 ALLOWED_FUNCTIONS={'SUM','COUNT','AVG','MIN','MAX','ROUND','COALESCE','CAST'}
-ALLOWED_COLUMNS={'customer','route','amount','temperature','invoice_id','status'}
+ALLOWED_COLUMNS={'customer','route','amount','temperature','invoice_id','status','version','location'}
 def validate_sql(sql):
     try: trees=sqlglot.parse(sql,read='postgres')
     except Exception as exc: raise ValueError('SQL 无法解析：'+str(exc)[:180])

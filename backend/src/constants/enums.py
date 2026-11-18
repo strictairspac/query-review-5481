@@ -1,2 +1,5 @@
 ROLES=('admin','operator','viewer')
 STATUSES=('queued','running','passed','different','failed')
+ARCHIVE_STATUSES=('pending','moving','completed','failed')
+INVOICE_STATUSES=('settled','pending')
+LOCATIONS=('hot','cold')
